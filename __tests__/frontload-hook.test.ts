@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { planFrontload, findIndexedSubprojectRoots, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens } from '../src/directory';
+import { planFrontload, findIndexedSubprojectRoots, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, isShortMessage, isCoordinationResponse, extractInjectedFiles, shouldSuppressInjection, readHookSession, writeHookSession, getHookSessionPath } from '../src/directory';
 
 /** Make `dir` look indexed (isInitialized needs `.codegraph/codegraph.db`). */
 function mkIndexed(dir: string): string {
@@ -199,5 +199,200 @@ describe('isStructuralPrompt — cheap candidate gate (keyword OR code-token)', 
     expect(isStructuralPrompt('修复这个拼写错误')).toBe(false);
     expect(isStructuralPrompt('water the flower')).toBe(false);
     expect(isStructuralPrompt('')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Layer 1: isShortMessage
+// ---------------------------------------------------------------------------
+
+describe('isShortMessage — rejects prompts with fewer than 4 words', () => {
+  it('returns true for empty/blank', () => {
+    expect(isShortMessage('')).toBe(true);
+    expect(isShortMessage('   ')).toBe(true);
+  });
+
+  it('returns true for 1–3 word messages', () => {
+    expect(isShortMessage('Yes')).toBe(true);
+    expect(isShortMessage('Ok')).toBe(true);
+    expect(isShortMessage('Do 1 and')).toBe(true); // 3 words
+    expect(isShortMessage('Go ahead')).toBe(true);
+  });
+
+  it('returns false for 4+ word messages', () => {
+    expect(isShortMessage('Do 1 and 2')).toBe(false); // 4 words
+    expect(isShortMessage('how does login work')).toBe(false);
+    expect(isShortMessage('implement option 2 please')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Layer 1: isCoordinationResponse
+// ---------------------------------------------------------------------------
+
+describe('isCoordinationResponse — whole-message pure-response patterns', () => {
+  it('matches single affirmatives (case-insensitive, trailing punctuation stripped)', () => {
+    expect(isCoordinationResponse('yes')).toBe(true);
+    expect(isCoordinationResponse('Yes.')).toBe(true);
+    expect(isCoordinationResponse('YES!')).toBe(true);
+    expect(isCoordinationResponse('no')).toBe(true);
+    expect(isCoordinationResponse('ok')).toBe(true);
+    expect(isCoordinationResponse('sure')).toBe(true);
+    expect(isCoordinationResponse('correct')).toBe(true);
+    expect(isCoordinationResponse('right')).toBe(true);
+    expect(isCoordinationResponse('perfect')).toBe(true);
+    expect(isCoordinationResponse('agreed')).toBe(true);
+    expect(isCoordinationResponse('great')).toBe(true);
+    expect(isCoordinationResponse('good')).toBe(true);
+  });
+
+  it('matches approval phrases', () => {
+    expect(isCoordinationResponse('sounds good')).toBe(true);
+    expect(isCoordinationResponse('Sounds good.')).toBe(true);
+    expect(isCoordinationResponse('that works')).toBe(true);
+    expect(isCoordinationResponse('looks good')).toBe(true);
+    expect(isCoordinationResponse('that makes sense')).toBe(true);
+    expect(isCoordinationResponse('looks right')).toBe(true);
+  });
+
+  it('matches numbered choice phrases', () => {
+    expect(isCoordinationResponse('option 2')).toBe(true);
+    expect(isCoordinationResponse('go with 1')).toBe(true);
+    expect(isCoordinationResponse('do 1 and 2')).toBe(true);
+    expect(isCoordinationResponse('1 and 2')).toBe(true);
+  });
+
+  it('does NOT match when message has substantive content beyond the pattern', () => {
+    expect(isCoordinationResponse('yes, that implementation is correct')).toBe(false);
+    expect(isCoordinationResponse('yes and also fix the bug')).toBe(false);
+    expect(isCoordinationResponse('looks good but add error handling')).toBe(false);
+  });
+
+  it('does NOT filter substantive questions that happen to contain these words', () => {
+    expect(isCoordinationResponse('implement option 2 in the auth module')).toBe(false);
+    expect(isCoordinationResponse('how should we structure this?')).toBe(false);
+  });
+
+  it('returns false for empty input', () => {
+    expect(isCoordinationResponse('')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Layer 2: extractInjectedFiles
+// ---------------------------------------------------------------------------
+
+describe('extractInjectedFiles — parses **`path`** file headers from explore output', () => {
+  it('extracts file paths from a typical explore response', () => {
+    const text = [
+      '**`src/auth/token.ts`** — parseToken(function), validateJWT(function)',
+      '```typescript',
+      'code here',
+      '```',
+      '**`src/middleware/index.ts`** — authMiddleware(function)',
+    ].join('\n');
+    expect(extractInjectedFiles(text).sort()).toEqual(['src/auth/token.ts', 'src/middleware/index.ts'].sort());
+  });
+
+  it('returns empty array when no file headers are present', () => {
+    expect(extractInjectedFiles('No file headers here — just prose.')).toEqual([]);
+    expect(extractInjectedFiles('')).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Layer 2: shouldSuppressInjection
+// ---------------------------------------------------------------------------
+
+describe('shouldSuppressInjection — dedup decision logic', () => {
+  const now = Date.now();
+  const TTL = 30 * 60 * 1000;
+
+  it('does not suppress on cold start (empty session)', () => {
+    const session = { lastActivity: 0, injectedFiles: [] };
+    expect(shouldSuppressInjection(session, ['a.ts', 'b.ts'], now, TTL)).toBe(false);
+  });
+
+  it('does not suppress when session is expired', () => {
+    const old = now - TTL - 1000;
+    const session = { lastActivity: old, injectedFiles: ['a.ts', 'b.ts'] };
+    expect(shouldSuppressInjection(session, ['a.ts', 'b.ts'], now, TTL)).toBe(false);
+  });
+
+  it('suppresses when 100% of files already seen', () => {
+    const session = { lastActivity: now - 1000, injectedFiles: ['a.ts', 'b.ts'] };
+    expect(shouldSuppressInjection(session, ['a.ts', 'b.ts'], now, TTL)).toBe(true);
+  });
+
+  it('suppresses at exactly the 70% threshold', () => {
+    // 7 of 10 new files already seen → 70% → suppress
+    const seen = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts', 'g.ts'];
+    const newFiles = [...seen, 'h.ts', 'i.ts', 'j.ts'];
+    const session = { lastActivity: now - 1000, injectedFiles: seen };
+    expect(shouldSuppressInjection(session, newFiles, now, TTL)).toBe(true);
+  });
+
+  it('does not suppress just below the 70% threshold', () => {
+    // 6 of 10 new files already seen → 60% → inject
+    const seen = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts'];
+    const newFiles = [...seen, 'g.ts', 'h.ts', 'i.ts', 'j.ts'];
+    const session = { lastActivity: now - 1000, injectedFiles: seen };
+    expect(shouldSuppressInjection(session, newFiles, now, TTL)).toBe(false);
+  });
+
+  it('does not suppress when newFiles is empty', () => {
+    const session = { lastActivity: now - 1000, injectedFiles: ['a.ts'] };
+    expect(shouldSuppressInjection(session, [], now, TTL)).toBe(false);
+  });
+
+  it('respects TTL=0 as "no session" (never suppress)', () => {
+    const session = { lastActivity: now - 1000, injectedFiles: ['a.ts', 'b.ts'] };
+    expect(shouldSuppressInjection(session, ['a.ts', 'b.ts'], now, 0)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Layer 2: readHookSession / writeHookSession / getHookSessionPath
+// ---------------------------------------------------------------------------
+
+describe('readHookSession / writeHookSession — session state I/O', () => {
+  let tmp: string;
+  beforeEach(() => { tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-session-'))); });
+  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+
+  function mkIndexed(dir: string): string {
+    fs.mkdirSync(path.join(dir, '.codegraph'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.codegraph', 'codegraph.db'), '');
+    return dir;
+  }
+
+  it('returns empty session when no state file exists (cold start)', () => {
+    mkIndexed(tmp);
+    const s = readHookSession(tmp);
+    expect(s.lastActivity).toBe(0);
+    expect(s.injectedFiles).toEqual([]);
+  });
+
+  it('round-trips a session through write + read', () => {
+    mkIndexed(tmp);
+    const session = { lastActivity: 1234567890, injectedFiles: ['src/a.ts', 'src/b.ts'] };
+    writeHookSession(tmp, session);
+    const loaded = readHookSession(tmp);
+    expect(loaded.lastActivity).toBe(session.lastActivity);
+    expect(loaded.injectedFiles).toEqual(session.injectedFiles);
+  });
+
+  it('returns empty session on malformed JSON', () => {
+    mkIndexed(tmp);
+    fs.writeFileSync(path.join(tmp, '.codegraph', '.hook-session.json'), 'not-json', 'utf-8');
+    const s = readHookSession(tmp);
+    expect(s.lastActivity).toBe(0);
+    expect(s.injectedFiles).toEqual([]);
+  });
+
+  it('getHookSessionPath lives inside .codegraph/', () => {
+    mkIndexed(tmp);
+    expect(getHookSessionPath(tmp)).toContain('.codegraph');
+    expect(getHookSessionPath(tmp)).toContain('.hook-session.json');
   });
 });

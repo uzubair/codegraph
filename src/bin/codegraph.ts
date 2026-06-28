@@ -26,7 +26,7 @@
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens, isShortMessage, isCoordinationResponse, readHookSession, writeHookSession, extractInjectedFiles, shouldSuppressInjection } from '../directory';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -1067,12 +1067,17 @@ program
       try { input = JSON.parse(raw); } catch { return; }
       const prompt = String(input.prompt || '');
 
-      // Gate: only structural / flow / impact / where-how prompts get context, so
-      // every other prompt ("fix this typo") stays a zero-cost no-op. Language-aware
-      // (English + CJK keywords, plus code-shaped tokens) so it fires for non-English
-      // prompts too (issue #994). A keyword fires on its own; a code-token is only a
-      // CANDIDATE — verified against the graph below, so a tech brand ("JavaScript")
-      // that looks like a symbol but isn't one here doesn't inject spurious context.
+      // Layer 1: coordination gate — reject obviously non-discovery messages
+      // (single-word affirmatives, approval phrases, numbered choices) before any
+      // I/O. This is stateless and costs ~0ms. It fires first so "implement option
+      // 2" — which contains the structural keyword "implement" — is correctly
+      // classified as coordination when the entire message is just that phrase.
+      if (isShortMessage(prompt) || isCoordinationResponse(prompt)) return;
+
+      // Existing structural gate: only flow/impact/where-how prompts proceed.
+      // Language-aware (English + CJK keywords, plus code-shaped tokens, issue #994).
+      // A keyword fires on its own; a code-token is only a CANDIDATE — verified
+      // against the graph below so a tech brand ("JavaScript") doesn't inject context.
       const keyworded = hasStructuralKeyword(prompt);
       const codeTokens = keyworded ? [] : extractCodeTokens(prompt);
       if (!keyworded && codeTokens.length === 0) return;
@@ -1081,53 +1086,72 @@ program
       // indexed ancestor of cwd, or — when cwd is an un-indexed workspace root
       // whose indexed project(s) live in sub-dirs (the monorepo case, #964) —
       // the sub-project the prompt points at, plus a `projectPath` nudge for any
-      // others. Without the down-scan the hook injected nothing at a monorepo
-      // root (it only walked up), so the validated adoption lever never fired
-      // exactly where the agent most needs it.
+      // others.
       const plan = planFrontload(String(input.cwd || process.cwd()), prompt);
-      if (!plan.exploreRoot && plan.nudgeProjects.length === 0) return; // nothing reachable — the agent's normal tools apply
+      if (!plan.exploreRoot && plan.nudgeProjects.length === 0) return;
 
-      // A "pass projectPath" line for indexed sub-projects we did NOT front-load.
-      // Follow-up codegraph_explore calls against a sub-project (cwd isn't its
-      // index root) need an explicit projectPath, so spell it out.
       const nudge = (projects: string[], lead: string): string =>
         `${lead}\n${projects.map((p) => `  - projectPath: "${p}"`).join('\n')}\n`;
+
+      const ttlMs = process.env.CODEGRAPH_HOOK_SESSION_TTL_MS
+        ? parseInt(process.env.CODEGRAPH_HOOK_SESSION_TTL_MS, 10)
+        : 30 * 60 * 1000;
+      const dedupEnabled = !isNaN(ttlMs) && ttlMs > 0;
 
       if (plan.exploreRoot) {
         const { default: CodeGraph } = await loadCodeGraph();
         const cg = await CodeGraph.open(plan.exploreRoot);
         try {
-          // Code-token-only prompt: require that at least one token is a REAL symbol
-          // in THIS index before front-loading. Without it, a brand name or common
-          // word that merely looks like code ("JavaScript", "GitHub") would run
-          // explore and inject ~16KB of low-relevance context (issue #994 follow-up).
-          // A keyword-bearing prompt skips this — the keyword is signal enough.
           if (!keyworded && !codeTokens.some((t) => cg.getNodesByName(t).length > 0)) return;
           const { ToolHandler } = await import('../mcp/tools');
           const handler = new ToolHandler(cg);
           const result = await handler.execute('codegraph_explore', { query: prompt });
           const text = result.content[0]?.text ?? '';
           if (!result.isError && text.trim()) {
-            // Cap the injection so a large-repo explore can't flood the prompt.
-            const MAX = 16000;
-            const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
-            // For a front-loaded SUB-project, a follow-up explore needs its path.
-            const more = plan.viaSubScan
-              ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
-              : 'call codegraph_explore for more';
-            const others = plan.nudgeProjects.length
-              ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
-              : '';
-            process.stdout.write(
-              `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
-            );
+            // Layer 2: dedup — suppress if ≥70% of the files in this result were
+            // already injected in the current session window. Reads/writes a small
+            // JSON state file in .codegraph/; any I/O error falls through to inject.
+            if (dedupEnabled) {
+              const newFiles = extractInjectedFiles(text);
+              const session = readHookSession(plan.exploreRoot);
+              if (shouldSuppressInjection(session, newFiles, Date.now(), ttlMs)) {
+                writeHookSession(plan.exploreRoot, { ...session, lastActivity: Date.now() });
+                return;
+              }
+              // Will inject — update session state after writing to stdout.
+              const MAX = 16000;
+              const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
+              const more = plan.viaSubScan
+                ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
+                : 'call codegraph_explore for more';
+              const others = plan.nudgeProjects.length
+                ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
+                : '';
+              process.stdout.write(
+                `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
+              );
+              const merged = [...new Set([...session.injectedFiles, ...newFiles])];
+              writeHookSession(plan.exploreRoot, { lastActivity: Date.now(), injectedFiles: merged });
+            } else {
+              // Dedup disabled (TTL=0) — inject unconditionally.
+              const MAX = 16000;
+              const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
+              const more = plan.viaSubScan
+                ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
+                : 'call codegraph_explore for more';
+              const others = plan.nudgeProjects.length
+                ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
+                : '';
+              process.stdout.write(
+                `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
+              );
+            }
           }
         } finally {
           cg.destroy();
         }
       } else {
-        // Several indexed sub-projects, none a clear match — don't guess; tell
-        // the agent they exist and how to query one.
+        // Several indexed sub-projects, none a clear match — nudge the agent.
         process.stdout.write(
           `<codegraph_context note="CodeGraph is available for this workspace's indexed sub-projects — query one by passing projectPath to codegraph_explore.">\n` +
           nudge(plan.nudgeProjects, "This workspace's CodeGraph indexes live in sub-projects. To use CodeGraph, call codegraph_explore with the projectPath of the relevant one:") +

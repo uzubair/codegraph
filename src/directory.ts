@@ -313,6 +313,135 @@ export function isStructuralPrompt(prompt: string): boolean {
   return hasStructuralKeyword(prompt) || extractCodeTokens(prompt).length > 0;
 }
 
+// ---------------------------------------------------------------------------
+// Layer 1: Coordination gate — stateless pre-filter for the front-load hook
+// ---------------------------------------------------------------------------
+
+/**
+ * True when the prompt has fewer than 4 words. Catches obvious coordination
+ * messages ("Yes", "Ok", "Do 1 and 2", "Go ahead") without any I/O.
+ */
+export function isShortMessage(prompt: string): boolean {
+  if (!prompt) return true;
+  return prompt.trim().split(/\s+/).filter(Boolean).length < 4;
+}
+
+const COORDINATION_AFFIRMATIVES = new Set([
+  'yes', 'no', 'ok', 'sure', 'correct', 'right', 'perfect', 'agreed', 'great', 'good',
+]);
+
+const COORDINATION_PHRASES: RegExp[] = [
+  /^sounds good$/,
+  /^that works$/,
+  /^looks good$/,
+  /^that makes sense$/,
+  /^looks right$/,
+  /^option \d+$/,
+  /^go with \d+$/,
+  /^do \d+ and \d+$/,
+  /^\d+ and \d+$/,
+];
+
+/**
+ * True when the entire message is a pure coordination response — an affirmative,
+ * approval phrase, or numbered choice — matched as a whole-message pattern after
+ * trimming, lowercasing, and stripping trailing punctuation. A message with
+ * substantive content beyond the pattern (e.g. "yes, that implementation is
+ * correct") returns false.
+ */
+export function isCoordinationResponse(prompt: string): boolean {
+  if (!prompt) return false;
+  const normalized = prompt.trim().toLowerCase().replace(/[.!?,;]+$/, '');
+  if (COORDINATION_AFFIRMATIVES.has(normalized)) return true;
+  return COORDINATION_PHRASES.some((re) => re.test(normalized));
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2: Session state + deduplication for the front-load hook
+// ---------------------------------------------------------------------------
+
+export interface HookSession {
+  lastActivity: number;
+  injectedFiles: string[];
+}
+
+/** Path of the per-project hook session state file (inside `.codegraph/`). */
+export function getHookSessionPath(exploreRoot: string): string {
+  return path.join(getCodeGraphDir(exploreRoot), '.hook-session.json');
+}
+
+/**
+ * Read the hook session state for `exploreRoot`. Returns an empty session on
+ * any error (ENOENT, malformed JSON) — never throws.
+ */
+export function readHookSession(exploreRoot: string): HookSession {
+  try {
+    const raw = fs.readFileSync(getHookSessionPath(exploreRoot), 'utf-8');
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed !== null &&
+      typeof parsed === 'object' &&
+      typeof (parsed as Record<string, unknown>).lastActivity === 'number' &&
+      Array.isArray((parsed as Record<string, unknown>).injectedFiles)
+    ) {
+      return parsed as HookSession;
+    }
+  } catch {
+    // ENOENT or malformed — start fresh
+  }
+  return { lastActivity: 0, injectedFiles: [] };
+}
+
+/**
+ * Atomically write hook session state via temp file + rename. Swallows all
+ * errors — dedup is a performance optimization, never a correctness requirement.
+ */
+export function writeHookSession(exploreRoot: string, session: HookSession): void {
+  const dest = getHookSessionPath(exploreRoot);
+  const tmp = `${dest}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(session), 'utf-8');
+    fs.renameSync(tmp, dest);
+  } catch {
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+  }
+}
+
+/** Regex matching the file-section headers the explore output emits: **`path`** */
+const FILE_HEADER_RE = /\*\*`([^`\n]+)`\*\*/g;
+
+/**
+ * Extract the file paths referenced in a `codegraph_explore` output string.
+ * Returns an empty array when the text contains no file headers (e.g. a
+ * nudge-only response with no source blocks).
+ */
+export function extractInjectedFiles(text: string): string[] {
+  const out: string[] = [];
+  for (const m of text.matchAll(FILE_HEADER_RE)) out.push(m[1]!);
+  return out;
+}
+
+/**
+ * Decide whether to suppress injection based on session state.
+ *
+ * Returns `true` (suppress) when the session is live and ≥70 % of the files
+ * in `newFiles` are already in `session.injectedFiles`. Returns `false`
+ * (inject) when the session is expired, the overlap is below threshold, or
+ * `newFiles` is empty.
+ */
+export function shouldSuppressInjection(
+  session: HookSession,
+  newFiles: string[],
+  nowMs: number = Date.now(),
+  ttlMs: number = 30 * 60 * 1000,
+): boolean {
+  if (newFiles.length === 0) return false;
+  if (session.lastActivity === 0 || nowMs - session.lastActivity > ttlMs) return false;
+  const seen = new Set(session.injectedFiles);
+  const overlap = newFiles.filter((f) => seen.has(f)).length;
+  return overlap / newFiles.length >= 0.7;
+}
+
 /**
  * What the front-load hook should do for a prompt issued from a directory.
  */
