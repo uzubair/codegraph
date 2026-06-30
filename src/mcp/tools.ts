@@ -30,6 +30,7 @@ import {
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { scanDynamicDispatch } from './dynamic-boundaries';
+import type { WorkspaceManager } from '../workspace/manager';
 
 /**
  * An expected, recoverable "codegraph can't serve this" condition — most
@@ -801,7 +802,15 @@ export class ToolHandler {
   // direct/in-process mode (one client, no concurrency to parallelize).
   private queryPool: QueryPool | null = null;
 
-  constructor(private cg: CodeGraph | null) {}
+  private workspace: WorkspaceManager | null = null;
+
+  constructor(private cg: CodeGraph | null, workspace?: WorkspaceManager) {
+    if (workspace) this.workspace = workspace;
+  }
+
+  setWorkspace(workspace: WorkspaceManager): void {
+    this.workspace = workspace;
+  }
 
   /**
    * Engine-only: attach (or detach with null) the worker-thread query pool. The
@@ -1359,6 +1368,28 @@ export class ToolHandler {
       // thread against the watched default instance, so it is NEVER off-loaded to
       // a worker (whose read connection has no watcher). It also skips the
       // auto-banner wrapper to avoid duplicating its own pending-files section.
+      if (this.workspace && !args.projectPath) {
+        if (toolName === 'codegraph_files') {
+          return this.textResult(
+            'codegraph_files requires a specific project. ' +
+            'Pass projectPath to target a repository in this workspace, ' +
+            'e.g. projectPath: "/absolute/path/to/repo".'
+          );
+        }
+        if (toolName === 'codegraph_status') {
+          return await this.handleWorkspaceStatus();
+        }
+        return await this.executeWorkspaceFanout(toolName, args);
+      }
+
+      // Pre-seed the cache with workspace graphs so projectPath lookups hit without a reopen.
+      if (this.workspace) {
+        for (const cg of this.workspace.openAllCodeGraphs()) {
+          const root = cg.getProjectRoot();
+          if (!this.projectCache.has(root)) this.projectCache.set(root, cg);
+        }
+      }
+
       if (toolName === 'codegraph_status') {
         return await this.handleStatus(args);
       }
@@ -4414,6 +4445,55 @@ export class ToolHandler {
     }
 
     return lines.join('\n');
+  }
+
+  private async handleWorkspaceStatus(): Promise<ToolResult> {
+    const repos = this.workspace!.listRepos();
+    if (repos.length === 0) {
+      return this.textResult('Workspace has no registered repositories. Run `codegraph workspace add <path>`.');
+    }
+    const lines: string[] = ['## Workspace Status\n'];
+    for (const repo of repos) {
+      const ts = repo.last_indexed_at ? new Date(repo.last_indexed_at).toISOString() : 'never';
+      const branch = repo.branch ? ` [${repo.branch}]` : '';
+      lines.push(`**${repo.name}** — ${repo.status}${branch}, last indexed: ${ts}`);
+      lines.push(`  path: ${repo.path}`);
+    }
+    return this.textResult(lines.join('\n'));
+  }
+
+  private async executeWorkspaceFanout(
+    toolName: string,
+    args: Record<string, unknown>
+  ): Promise<ToolResult> {
+    const graphs = this.workspace!.openAllCodeGraphs();
+    if (graphs.length === 0) {
+      return this.textResult(
+        'No indexed repositories in this workspace. Run `codegraph workspace index` to index them.'
+      );
+    }
+    // Seed the project cache so getCodeGraph(projectPath) finds the already-open
+    // instances without going through the lazy require (which fails in test env).
+    for (const cg of graphs) {
+      const root = cg.getProjectRoot();
+      if (!this.projectCache.has(root)) this.projectCache.set(root, cg);
+    }
+    const parts: string[] = [];
+    for (const cg of graphs) {
+      const repoRoot = cg.getProjectRoot();
+      const repoName = this.workspace!.getRepoName(repoRoot);
+      const repoArgs = { ...args, projectPath: repoRoot };
+      try {
+        const result = await this.executeReadTool(toolName, repoArgs);
+        if (!result.isError) {
+          parts.push(`## [${repoName}]\n\n${result.content.map(c => c.text).join('\n')}`);
+        }
+      } catch { /* skip repos that fail */ }
+    }
+    if (parts.length === 0) {
+      return this.textResult('No results found across the workspace.');
+    }
+    return this.textResult(parts.join('\n\n---\n\n'));
   }
 
   private textResult(text: string): ToolResult {

@@ -2200,6 +2200,182 @@ program
     console.log(packageJson.version);
   });
 
+// =============================================================================
+// codegraph workspace <subcommand>
+// =============================================================================
+
+const workspaceCmd = program
+  .command('workspace')
+  .description('Manage a multi-repository CodeGraph workspace');
+
+workspaceCmd
+  .command('init [path]')
+  .description('Create a new workspace in the given directory (default: cwd)')
+  .option('--name <name>', 'Workspace name (default: directory basename)')
+  .action(async (pathArg: string | undefined, options: { name?: string }) => {
+    const { WorkspaceManager } = await import('../workspace/manager');
+    const clack = await importESM('@clack/prompts');
+    const wsPath = path.resolve(pathArg ?? process.cwd());
+    const name = options.name ?? path.basename(wsPath);
+    clack.intro('Initializing workspace');
+    try {
+      WorkspaceManager.init(wsPath, name).close();
+      clack.log.success(`Workspace "${name}" initialized in ${wsPath}`);
+      clack.outro('Run `codegraph workspace add <path>` to add repositories');
+    } catch (err) {
+      clack.log.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+workspaceCmd
+  .command('add <repoPath>')
+  .description('Add a repository to the workspace (runs codegraph init if needed)')
+  .option('--name <name>', 'Logical name for the repository (default: directory basename)')
+  .action(async (repoPath: string, options: { name?: string }) => {
+    const { WorkspaceManager } = await import('../workspace/manager');
+    const clack = await importESM('@clack/prompts');
+    const manager = WorkspaceManager.findNearest(process.cwd());
+    if (!manager) {
+      clack.log.error('No workspace found. Run `codegraph workspace init` first.');
+      process.exit(1);
+    }
+    clack.intro('Adding repository');
+    try {
+      await manager.addRepo(repoPath, options.name);
+      const repos = manager.listRepos();
+      const added = repos[repos.length - 1]!;
+      clack.log.success(`Added "${added.name}" (${added.path})`);
+      clack.outro('Run `codegraph workspace index` to index it');
+    } catch (err) {
+      clack.log.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    } finally {
+      manager.close();
+    }
+  });
+
+workspaceCmd
+  .command('remove <name>')
+  .description('Remove a repository from the workspace registry (leaves .codegraph/ on disk)')
+  .action(async (name: string) => {
+    const { WorkspaceManager } = await import('../workspace/manager');
+    const clack = await importESM('@clack/prompts');
+    const manager = WorkspaceManager.findNearest(process.cwd());
+    if (!manager) {
+      clack.log.error('No workspace found. Run `codegraph workspace init` first.');
+      process.exit(1);
+    }
+    try {
+      manager.removeRepo(name);
+      clack.log.success(`Removed "${name}" from workspace`);
+    } catch (err) {
+      clack.log.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    } finally {
+      manager.close();
+    }
+  });
+
+workspaceCmd
+  .command('index')
+  .description('Index all repositories in the workspace')
+  .option('-v, --verbose', 'Show detailed progress')
+  .action(async (options: { verbose?: boolean }) => {
+    const { WorkspaceManager } = await import('../workspace/manager');
+    const clack = await importESM('@clack/prompts');
+    const manager = WorkspaceManager.findNearest(process.cwd());
+    if (!manager) {
+      clack.log.error('No workspace found. Run `codegraph workspace init` first.');
+      process.exit(1);
+    }
+    clack.intro('Indexing workspace');
+    try {
+      const results = await manager.indexAll(options.verbose ? { onProgress: createVerboseProgress() } : undefined);
+      const repos = manager.listRepos();
+      for (let i = 0; i < repos.length; i++) {
+        const repo = repos[i]!;
+        const result = results[i];
+        if (result?.success) {
+          clack.log.success(`${repo.name}: ${result.filesIndexed} files indexed`);
+        } else {
+          clack.log.error(`${repo.name}: failed — ${result?.errors[0]?.message ?? 'unknown error'}`);
+        }
+      }
+      clack.outro('Done');
+    } catch (err) {
+      clack.log.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    } finally {
+      manager.close();
+    }
+  });
+
+workspaceCmd
+  .command('list')
+  .description('List all repositories in the workspace')
+  .action(async () => {
+    const { WorkspaceManager } = await import('../workspace/manager');
+    const manager = WorkspaceManager.findNearest(process.cwd());
+    if (!manager) {
+      console.error('No workspace found.');
+      process.exit(1);
+    }
+    const repos = manager.listRepos();
+    if (repos.length === 0) {
+      console.log('No repositories registered. Run `codegraph workspace add <path>`.');
+    } else {
+      for (const repo of repos) {
+        const ts = repo.last_indexed_at ? new Date(repo.last_indexed_at).toISOString() : 'never';
+        const branch = repo.branch ? ` [${repo.branch}]` : '';
+        const sha = repo.commit_sha ? ` @${repo.commit_sha}` : '';
+        console.log(`  ${repo.status === 'indexed' ? '✓' : '○'} ${repo.name}  ${repo.path}${branch}${sha}  (last indexed: ${ts})`);
+      }
+    }
+    manager.close();
+  });
+
+workspaceCmd
+  .command('status')
+  .description('Show workspace health summary')
+  .action(async () => {
+    const { WorkspaceManager } = await import('../workspace/manager');
+    const manager = WorkspaceManager.findNearest(process.cwd());
+    if (!manager) {
+      console.error('No workspace found.');
+      process.exit(1);
+    }
+    const s = manager.getStatus();
+    console.log(`Workspace: ${manager.getWorkspaceRoot()}`);
+    console.log(`Repos: ${s.indexed} indexed / ${s.total} total${s.errored ? `  (${s.errored} errored)` : ''}`);
+    manager.close();
+  });
+
+workspaceCmd
+  .command('doctor')
+  .description('Check workspace health — missing paths, un-indexed repos, stale indexes')
+  .action(async () => {
+    const { WorkspaceManager } = await import('../workspace/manager');
+    const clack = await importESM('@clack/prompts');
+    const manager = WorkspaceManager.findNearest(process.cwd());
+    if (!manager) {
+      clack.log.error('No workspace found.');
+      process.exit(1);
+    }
+    const results = manager.doctor();
+    let hasIssues = false;
+    for (const r of results) {
+      if (r.issues.length === 0) {
+        clack.log.success(`${r.name}: OK`);
+      } else {
+        hasIssues = true;
+        for (const issue of r.issues) clack.log.error(`${r.name}: ${issue}`);
+      }
+    }
+    if (!hasIssues) clack.outro('All repositories are healthy');
+    manager.close();
+  });
+
 // Parse and run
 program.parse();
 

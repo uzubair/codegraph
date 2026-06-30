@@ -26,6 +26,9 @@ import { QueryPool, resolvePoolSize } from './query-pool';
 const loadCodeGraph = (): typeof import('../index').default =>
   (require('../index') as typeof import('../index')).default;
 
+const loadWorkspaceManager = (): typeof import('../workspace/manager').WorkspaceManager =>
+  (require('../workspace/manager') as typeof import('../workspace/manager')).WorkspaceManager;
+
 export interface MCPEngineOptions {
   /**
    * Whether to start the file watcher when initializing. Daemon and direct
@@ -65,6 +68,7 @@ export class MCPEngine {
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
   // project is open — workers each hold their own WAL read connection.
   private queryPool: QueryPool | null = null;
+  private workspace: import('../workspace/manager').WorkspaceManager | null = null;
 
   constructor(opts: MCPEngineOptions = {}) {
     this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
@@ -196,6 +200,10 @@ export class MCPEngine {
       try { this.cg.close(); } catch { /* ignore */ }
       this.cg = null;
     }
+    if (this.workspace) {
+      try { this.workspace.close(); } catch { /* ignore */ }
+      this.workspace = null;
+    }
   }
 
   private async doInitialize(searchFrom: string): Promise<void> {
@@ -219,6 +227,19 @@ export class MCPEngine {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[CodeGraph MCP] Failed to open project at ${resolvedRoot}: ${msg}\n`);
     }
+
+    // Search from the original path — workspace root can be above resolvedRoot.
+    try {
+      const workspace = loadWorkspaceManager().findNearest(searchFrom);
+      if (workspace) {
+        this.workspace = workspace;
+        this.toolHandler.setWorkspace(workspace);
+        process.stderr.write(
+          `[CodeGraph MCP] Workspace detected at ${workspace.getWorkspaceRoot()} — ` +
+          `multi-repo fanout enabled (${workspace.listRepos().length} repo(s) registered)\n`
+        );
+      }
+    } catch { /* workspace detection is best-effort; never break the server */ }
   }
 
   /**

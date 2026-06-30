@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Workspace support: manage multiple repositories under a single `codegraph-workspace.yaml`. Use `codegraph workspace init`, `codegraph workspace add`, and `codegraph workspace index` to set up a workspace, then attach the MCP server to the workspace root — `codegraph_explore` and `codegraph_search` automatically fan out across all indexed repos and return attributed results.
 
 ## [1.1.2] - 2026-06-28
 
